@@ -76,3 +76,8 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# Keep published firmware artifacts in repo
+!firmware/
+!firmware/**/*.bin
+!firmware/**/*.sha256
