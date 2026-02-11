@@ -38,6 +38,6 @@ config SNIFFER_ENABLE_OTA
 
 config SNIFFER_OTA_FIRMWARE_URL
     string "OTA firmware URL (HTTPS)"
-    default "https://github.com/Samat1989/esp_firmware/releases/download/1.0.7/sniffer_esp.bin"
+    default "https://github.com/Samat1989/sniffer_esp/releases/latest/download/sniffer_esp.bin"
 
 endmenu
