@@ -30,7 +30,6 @@ Set-Location $repoRoot
 
 Invoke-Step "Checking prerequisites" {
     Assert-Tool "git"
-    Assert-Tool "idf.py"
     if (-not (Test-Path -LiteralPath $ExportScript)) {
         throw "ESP-IDF export script not found: $ExportScript"
     }
@@ -50,10 +49,21 @@ Invoke-Step "Activating ESP-IDF environment" {
     & $ExportScript
 }
 
+Invoke-Step "Checking ESP-IDF tools" {
+    Assert-Tool "idf.py"
+}
+
 if ($FullClean) {
     Invoke-Step "Running fullclean" {
         idf.py fullclean
     }
+}
+
+Invoke-Step "Configuring build for release tag $Tag" {
+    # Force PROJECT_VER to use target tag in local release flow.
+    $env:GITHUB_REF_TYPE = "tag"
+    $env:GITHUB_REF_NAME = $Tag
+    idf.py reconfigure
 }
 
 Invoke-Step "Building firmware" {
