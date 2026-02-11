@@ -6,7 +6,10 @@ param(
     [string]$ExportScript = "C:\Espressif\frameworks\esp-idf-v5.5\export.ps1",
 
     [switch]$FullClean,
-    [switch]$Push
+    [switch]$Push,
+    [switch]$PublishRelease,
+    [string]$Repo = "",
+    [string]$Token = $env:GITHUB_TOKEN
 )
 
 $ErrorActionPreference = "Stop"
@@ -115,6 +118,16 @@ if ($Push) {
     Write-Host "`nRelease prepared locally. To push now run:" -ForegroundColor Yellow
     Write-Host "git push origin main"
     Write-Host "git push origin $Tag"
+}
+
+if ($PublishRelease) {
+    Invoke-Step "Publishing GitHub release assets (no Actions)" {
+        $publishScript = Join-Path $PSScriptRoot "publish-github-release.ps1"
+        if (-not (Test-Path -LiteralPath $publishScript)) {
+            throw "Script not found: $publishScript"
+        }
+        & $publishScript -Tag $Tag -Repo $Repo -Token $Token
+    }
 }
 
 Write-Host "`nDone: firmware artifacts are in firmware\$Tag and firmware\latest" -ForegroundColor Green
