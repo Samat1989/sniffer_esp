@@ -1,0 +1,21 @@
+Command: ninja all
+[1/9] Performing build step for 'bootloader'
+[1/1] C:\WINDOWS\system32\cmd.exe /C "cd /D C:\esp_projects\sniffer_esp\build_py313\bootloader\esp-idf\esptool_py && C:\Espressif\python_env\idf5.5_py3.13_env\Scripts\python.exe C:/Espressif/frameworks/esp-idf-v5.5/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x1000 C:/esp_projects/sniffer_esp/build_py313/bootloader/bootloader.bin"
+Bootloader binary size 0x6680 bytes. 0x980 bytes (8%) free.
+[2/9] No install step for 'bootloader'
+[3/9] Completed 'bootloader'
+[4/9] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/main.c.obj
+C:/esp_projects/sniffer_esp/main/main.c:435:13: warning: 'build_status_reply' defined but not used [-Wunused-function]
+  435 | static void build_status_reply(char *out, size_t out_len)
+      |             ^~~~~~~~~~~~~~~~~~
+[5/9] Linking C static library esp-idf\main\libmain.a
+[6/9] Generating esp-idf/esp_system/ld/sections.ld
+[7/9] Linking CXX executable sniffer_esp.elf
+[8/9] Generating binary image from built executable
+esptool.py v4.11.dev2
+Creating esp32 image...
+Merged 2 ELF sections
+Successfully created esp32 image.
+Generated C:/esp_projects/sniffer_esp/build_py313/sniffer_esp.bin
+[9/9] C:\WINDOWS\system32\cmd.exe /C "cd /D C:\esp_projects\sniffer_esp\build_py313\esp-idf\esptool_py && C:\Espressif\python_env\idf5.5_py3.13_env\Scripts\python.exe C:/Espressif/frameworks/esp-idf-v5.5/components/partition_table/check_sizes.py --offset 0x8000 partition --type app C:/esp_projects/sniffer_esp/build_py313/partition_table/partition-table.bin C:/esp_projects/sniffer_esp/build_py313/sniffer_esp.bin"
+sniffer_esp.bin binary size 0xef0c0 bytes. Smallest app partition is 0x100000 bytes. 0x10f40 bytes (7%) free.

@@ -1,0 +1,43 @@
+menu "Sniffer Config"
+
+config SNIFFER_CLK_GPIO
+    int "CLK input GPIO"
+    default 18
+
+config SNIFFER_DATA_GPIO
+    int "DATA input GPIO"
+    default 19
+
+config SNIFFER_FRAME_GAP_US
+    int "Frame gap in microseconds"
+    default 2500
+
+config SNIFFER_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+
+config SNIFFER_WIFI_PASSWORD
+    string "WiFi password"
+    default ""
+
+config SNIFFER_ENABLE_TELEGRAM
+    bool "Enable Telegram publish"
+    default n
+
+config SNIFFER_TELEGRAM_BOT_TOKEN
+    string "Telegram bot token"
+    default ""
+
+config SNIFFER_TELEGRAM_CHAT_ID
+    string "Telegram chat id"
+    default ""
+
+config SNIFFER_ENABLE_OTA
+    bool "Enable OTA update via GitHub URL"
+    default n
+
+config SNIFFER_OTA_FIRMWARE_URL
+    string "OTA firmware URL (HTTPS)"
+    default "https://github.com/Samat1989/esp_firmware/releases/download/1.0.7/sniffer_esp.bin"
+
+endmenu
