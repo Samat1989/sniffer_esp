@@ -94,7 +94,7 @@ foreach ($file in $assets) {
     }
 
     $encoded = [System.Uri]::EscapeDataString($assetName)
-    $assetUri = "$uploadUrl?name=$encoded"
+    $assetUri = "${uploadUrl}?name=$encoded"
     Invoke-GhApi -Method "POST" -Uri $assetUri -Body $file.FullName -ContentType "application/octet-stream" | Out-Null
     Write-Host "Uploaded: $assetName"
 }
