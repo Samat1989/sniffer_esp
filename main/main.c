@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
+#include "soc/gpio_struct.h"
 
 #if __has_include("esp_crt_bundle.h")
 #include "esp_crt_bundle.h"
@@ -44,6 +45,13 @@
 #define MAX_MUX_SLOTS 8
 #define MUX_DIGIT_STALE_US (500LL * 1000LL)
 #define CROSS_FRAME_PAIR_US (20LL * 1000LL)
+#define AUTO_GAP_MULTIPLIER 12
+#define AUTO_GAP_MIN_US 120
+#define TIMING_LOG_PERIOD_US (2000LL * 1000LL)
+#define PAUSE_SHORT_US 6000
+#define PAUSE_MID_US 11000
+#define PAUSE_LONG_US 18000
+#define MAX_CYCLE_BYTES 96
 
 #define TELEGRAM_POLL_TIMEOUT_S 5
 #define TELEGRAM_RESP_MAX 2048
@@ -84,6 +92,43 @@ static int64_t s_mux_seen_us[MAX_MUX_SLOTS];
 static bool s_prev_single_valid;
 static uint8_t s_prev_single_byte;
 static int64_t s_prev_single_ts_us;
+
+static inline uint32_t IRAM_ATTR gpio_level_fast(gpio_num_t gpio_num)
+{
+    if ((uint32_t)gpio_num < 32U) {
+        return (GPIO.in >> (uint32_t)gpio_num) & 0x1U;
+    }
+    return (GPIO.in1.data >> ((uint32_t)gpio_num - 32U)) & 0x1U;
+}
+
+typedef struct {
+    uint64_t dt_count;
+    uint64_t dt_sum_us;
+    int64_t dt_min_us;
+    int64_t dt_max_us;
+    uint32_t long_gap_count;
+    int64_t long_gap_max_us;
+    int64_t clk_period_ema_us;
+    int64_t last_log_ts_us;
+} timing_stats_t;
+
+typedef enum {
+    GAP_NONE = 0,
+    GAP_SHORT,
+    GAP_MID,
+    GAP_LONG,
+} gap_kind_t;
+
+typedef struct {
+    uint8_t bytes[MAX_CYCLE_BYTES];
+    int nbytes;
+    int subframes;
+    int gap_short_count;
+    int gap_mid_count;
+    int gap_long_count;
+    int64_t start_ts_us;
+    int64_t last_ts_us;
+} cycle_state_t;
 
 static int64_t telegram_load_next_offset(void)
 {
@@ -729,7 +774,170 @@ static void handle_frame(const uint8_t *bits, int nbits)
     s_last_frame_us = esp_timer_get_time();
     xSemaphoreGive(s_state_mutex);
 
-    ESP_LOGI(TAG, "frame bits=%d raw=%s bytes=[%s] decoded=%s status=%s", nbits, raw, hex, decoded, status);
+    ESP_LOGD(TAG, "frame bits=%d raw=%s bytes=[%s] decoded=%s status=%s", nbits, raw, hex, decoded, status);
+}
+
+static gap_kind_t classify_gap_kind(int64_t dt_us)
+{
+    if (dt_us >= PAUSE_LONG_US) {
+        return GAP_LONG;
+    }
+    if (dt_us >= PAUSE_MID_US) {
+        return GAP_MID;
+    }
+    if (dt_us >= PAUSE_SHORT_US) {
+        return GAP_SHORT;
+    }
+    return GAP_NONE;
+}
+
+static void cycle_reset(cycle_state_t *cycle)
+{
+    memset(cycle, 0, sizeof(*cycle));
+}
+
+static void cycle_add_subframe(cycle_state_t *cycle, const uint8_t *bytes, int nbytes, gap_kind_t gap_kind, int64_t ts_us)
+{
+    if (nbytes <= 0) {
+        return;
+    }
+
+    if (cycle->start_ts_us == 0) {
+        cycle->start_ts_us = ts_us;
+    }
+    cycle->last_ts_us = ts_us;
+    cycle->subframes++;
+
+    if (gap_kind == GAP_SHORT) {
+        cycle->gap_short_count++;
+    } else if (gap_kind == GAP_MID) {
+        cycle->gap_mid_count++;
+    } else if (gap_kind == GAP_LONG) {
+        cycle->gap_long_count++;
+    }
+
+    for (int i = 0; i < nbytes && cycle->nbytes < MAX_CYCLE_BYTES; ++i) {
+        cycle->bytes[cycle->nbytes++] = bytes[i];
+    }
+}
+
+static int cycle_compact_bytes(const cycle_state_t *cycle, uint8_t *out, int out_max)
+{
+    int n = 0;
+    bool has_prev = false;
+    uint8_t prev = 0;
+
+    for (int i = 0; i < cycle->nbytes && n < out_max; ++i) {
+        uint8_t b = cycle->bytes[i];
+        if (!has_prev || b != prev) {
+            out[n++] = b;
+            prev = b;
+            has_prev = true;
+        }
+    }
+    return n;
+}
+
+static void handle_cycle_decode(const cycle_state_t *cycle)
+{
+    if (!cycle || cycle->subframes == 0 || cycle->nbytes == 0) {
+        return;
+    }
+
+    uint8_t compact[32] = {0};
+    int compact_n = cycle_compact_bytes(cycle, compact, (int)(sizeof(compact) / sizeof(compact[0])));
+    if (compact_n <= 0) {
+        return;
+    }
+
+    char compact_hex[128] = {0};
+    char decoded[16] = {0};
+    const char *status = "unknown";
+    build_hex_string(compact, compact_n, compact_hex, sizeof(compact_hex));
+    decode_digits(compact, compact_n, decoded, sizeof(decoded), &status);
+
+    ESP_LOGD(TAG,
+             "cycle subframes=%d bytes=%d gaps[s/m/l]=%d/%d/%d compact=[%s] decoded=%s status=%s",
+             cycle->subframes,
+             cycle->nbytes,
+             cycle->gap_short_count,
+             cycle->gap_mid_count,
+             cycle->gap_long_count,
+             compact_hex,
+             decoded,
+             status);
+}
+
+static int64_t effective_gap_us_from_timing(const timing_stats_t *ts)
+{
+    int64_t gap_us = FRAME_GAP_US;
+    if (ts->clk_period_ema_us > 0) {
+        int64_t auto_gap_us = ts->clk_period_ema_us * AUTO_GAP_MULTIPLIER;
+        if (auto_gap_us < AUTO_GAP_MIN_US) {
+            auto_gap_us = AUTO_GAP_MIN_US;
+        }
+        if (auto_gap_us > gap_us) {
+            gap_us = auto_gap_us;
+        }
+    }
+    return gap_us;
+}
+
+static void update_timing_stats(timing_stats_t *ts, int64_t dt_us, int64_t used_gap_us)
+{
+    if (dt_us <= 0) {
+        return;
+    }
+
+    ts->dt_count++;
+    ts->dt_sum_us += (uint64_t)dt_us;
+
+    if (ts->dt_min_us == 0 || dt_us < ts->dt_min_us) {
+        ts->dt_min_us = dt_us;
+    }
+    if (dt_us > ts->dt_max_us) {
+        ts->dt_max_us = dt_us;
+    }
+
+    if (dt_us <= used_gap_us) {
+        if (ts->clk_period_ema_us == 0) {
+            ts->clk_period_ema_us = dt_us;
+        } else {
+            ts->clk_period_ema_us = ((ts->clk_period_ema_us * 15) + dt_us) / 16;
+        }
+    } else {
+        ts->long_gap_count++;
+        if (dt_us > ts->long_gap_max_us) {
+            ts->long_gap_max_us = dt_us;
+        }
+        ESP_LOGD(TAG, "gap candidate dt=%lldus (boundary, current_gap=%lldus)", (long long)dt_us, (long long)used_gap_us);
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    if (ts->last_log_ts_us == 0) {
+        ts->last_log_ts_us = now_us;
+        return;
+    }
+
+    if ((now_us - ts->last_log_ts_us) >= TIMING_LOG_PERIOD_US) {
+        uint64_t avg = ts->dt_count ? (ts->dt_sum_us / ts->dt_count) : 0;
+        ESP_LOGD(TAG,
+                 "timing dt_us min=%lld avg=%llu max=%lld ema=%lld gap=%lld long_gaps=%u long_max=%lld",
+                 (long long)ts->dt_min_us,
+                 (unsigned long long)avg,
+                 (long long)ts->dt_max_us,
+                 (long long)ts->clk_period_ema_us,
+                 (long long)effective_gap_us_from_timing(ts),
+                 ts->long_gap_count,
+                 (long long)ts->long_gap_max_us);
+        ts->dt_count = 0;
+        ts->dt_sum_us = 0;
+        ts->dt_min_us = 0;
+        ts->dt_max_us = 0;
+        ts->long_gap_count = 0;
+        ts->long_gap_max_us = 0;
+        ts->last_log_ts_us = now_us;
+    }
 }
 
 static void sniffer_task(void *arg)
@@ -739,25 +947,64 @@ static void sniffer_task(void *arg)
     uint8_t bits[MAX_FRAME_BITS] = {0};
     int nbits = 0;
     int64_t last_ts = 0;
+    timing_stats_t t = {0};
+    cycle_state_t cycle = {0};
 
     while (1) {
         if (xQueueReceive(s_bit_queue, &ev, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            if (nbits > 0 && (ev.ts_us - last_ts) > FRAME_GAP_US) {
+            int64_t gap_us = effective_gap_us_from_timing(&t);
+            gap_kind_t gap_kind = GAP_NONE;
+            int64_t dt_us = 0;
+            if (last_ts > 0) {
+                dt_us = ev.ts_us - last_ts;
+                update_timing_stats(&t, dt_us, gap_us);
+                gap_us = effective_gap_us_from_timing(&t);
+                gap_kind = classify_gap_kind(dt_us);
+            }
+
+            if (nbits > 0 && (ev.ts_us - last_ts) > gap_us) {
                 handle_frame(bits, nbits);
+                if ((nbits % 8) == 0) {
+                    uint8_t frame_bytes[8] = {0};
+                    int nbytes = bits_to_bytes(bits, nbits, frame_bytes, (int)(sizeof(frame_bytes) / sizeof(frame_bytes[0])));
+                    cycle_add_subframe(&cycle, frame_bytes, nbytes, gap_kind, last_ts);
+                }
+
+                if (gap_kind == GAP_LONG) {
+                    handle_cycle_decode(&cycle);
+                    cycle_reset(&cycle);
+                }
                 nbits = 0;
             }
 
             if (nbits < MAX_FRAME_BITS) {
                 bits[nbits++] = ev.bit;
             } else {
-                ESP_LOGW(TAG, "frame overflow, reset");
+                ESP_LOGW(TAG, "frame overflow, force flush bits=%d", nbits);
+                handle_frame(bits, nbits);
+                if ((nbits % 8) == 0) {
+                    uint8_t frame_bytes[8] = {0};
+                    int nbytes = bits_to_bytes(bits, nbits, frame_bytes, (int)(sizeof(frame_bytes) / sizeof(frame_bytes[0])));
+                    cycle_add_subframe(&cycle, frame_bytes, nbytes, GAP_NONE, last_ts);
+                }
                 nbits = 0;
             }
             last_ts = ev.ts_us;
         } else if (nbits > 0) {
-            if ((esp_timer_get_time() - last_ts) > FRAME_GAP_US) {
+            int64_t gap_us = effective_gap_us_from_timing(&t);
+            int64_t idle_us = esp_timer_get_time() - last_ts;
+            if (idle_us > gap_us) {
                 handle_frame(bits, nbits);
+                if ((nbits % 8) == 0) {
+                    uint8_t frame_bytes[8] = {0};
+                    int nbytes = bits_to_bytes(bits, nbits, frame_bytes, (int)(sizeof(frame_bytes) / sizeof(frame_bytes[0])));
+                    cycle_add_subframe(&cycle, frame_bytes, nbytes, GAP_NONE, last_ts);
+                }
                 nbits = 0;
+            }
+            if (idle_us > PAUSE_LONG_US) {
+                handle_cycle_decode(&cycle);
+                cycle_reset(&cycle);
             }
         }
     }
@@ -766,13 +1013,8 @@ static void sniffer_task(void *arg)
 static void IRAM_ATTR clk_isr_handler(void *arg)
 {
     (void)arg;
-    // SN74HC164 samples DATA on CLK rising edge; capture only while CLK is high.
-    if (gpio_get_level(CLK_GPIO) == 0) {
-        return;
-    }
-
     bit_event_t ev;
-    ev.bit = (uint8_t)gpio_get_level(DATA_GPIO);
+    ev.bit = (uint8_t)gpio_level_fast((gpio_num_t)DATA_GPIO);
     ev.ts_us = esp_timer_get_time();
 
     BaseType_t hp_task_woken = pdFALSE;
