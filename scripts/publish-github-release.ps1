@@ -9,6 +9,28 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-EnvValueFromFile([string]$FilePath, [string]$Key) {
+    if (-not (Test-Path -LiteralPath $FilePath)) {
+        return $null
+    }
+
+    foreach ($line in Get-Content -LiteralPath $FilePath) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#")) {
+            continue
+        }
+        $parts = $trimmed -split "=", 2
+        if ($parts.Count -ne 2) {
+            continue
+        }
+        if ($parts[0].Trim() -ne $Key) {
+            continue
+        }
+        return $parts[1].Trim().Trim("'`"")
+    }
+    return $null
+}
+
 function Get-RepoFromGitRemote {
     $url = (git remote get-url origin).Trim()
     if (-not $url) {
@@ -46,15 +68,20 @@ function Invoke-GhApi([string]$Method, [string]$Uri, $Body = $null, [string]$Con
     return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -InFile $Body -ContentType $ContentType
 }
 
+$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 if (-not $Token) {
-    throw "GITHUB_TOKEN is empty. Set it before running this script."
+    $envFile = Join-Path $repoRoot ".env.local"
+    $Token = Get-EnvValueFromFile -FilePath $envFile -Key "GITHUB_TOKEN"
+}
+
+if (-not $Token) {
+    throw "GITHUB_TOKEN is empty. Set env var, pass -Token, or define it in .env.local."
 }
 
 if (-not $Repo) {
     $Repo = Get-RepoFromGitRemote
 }
 
-$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $releaseDir = Join-Path $repoRoot "firmware\$Tag"
 if (-not (Test-Path -LiteralPath $releaseDir)) {
     throw "Release folder not found: $releaseDir. Run release-local.ps1 first."

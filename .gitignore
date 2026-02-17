@@ -77,6 +77,9 @@ Desktop.ini
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
 
+# Local secrets
+.env.local
+
 # Keep published firmware artifacts in repo
 !firmware/
 !firmware/**/*.bin

@@ -25,8 +25,35 @@ function Assert-Tool([string]$ToolName) {
     }
 }
 
+function Get-EnvValueFromFile([string]$FilePath, [string]$Key) {
+    if (-not (Test-Path -LiteralPath $FilePath)) {
+        return $null
+    }
+
+    foreach ($line in Get-Content -LiteralPath $FilePath) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#")) {
+            continue
+        }
+        $parts = $trimmed -split "=", 2
+        if ($parts.Count -ne 2) {
+            continue
+        }
+        if ($parts[0].Trim() -ne $Key) {
+            continue
+        }
+        return $parts[1].Trim().Trim("'`"")
+    }
+    return $null
+}
+
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
+
+if (-not $Token) {
+    $envFile = Join-Path $repoRoot ".env.local"
+    $Token = Get-EnvValueFromFile -FilePath $envFile -Key "GITHUB_TOKEN"
+}
 
 Invoke-Step "Checking prerequisites" {
     Assert-Tool "git"
