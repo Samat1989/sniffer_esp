@@ -1,13 +1,13 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidatePattern("^v[0-9]+(\.[0-9]+){1,3}([\-+][0-9A-Za-z\.\-]+)?$")]
-    [string]$Tag,
+    [string]$Tag = "",
 
     [string]$Repo = "",
     [string]$Token = $env:GITHUB_TOKEN
 )
 
 $ErrorActionPreference = "Stop"
+
+$TagPattern = "^v[0-9]+(\.[0-9]+){1,3}([\-+][0-9A-Za-z\.\-]+)?$"
 
 function Get-EnvValueFromFile([string]$FilePath, [string]$Key) {
     if (-not (Test-Path -LiteralPath $FilePath)) {
@@ -50,6 +50,23 @@ function Get-RepoFromGitRemote {
     throw "Unsupported origin remote URL: $url"
 }
 
+function Resolve-DefaultTag {
+    $headTags = @(git tag --points-at HEAD --list "v*" 2>$null)
+    if ($headTags.Count -gt 0) {
+        return $headTags[0].Trim()
+    }
+
+    $allTags = @(git tag --sort=-v:refname --list "v*" 2>$null)
+    foreach ($t in $allTags) {
+        $trimmed = $t.Trim()
+        if ($trimmed -match $TagPattern) {
+            return $trimmed
+        }
+    }
+
+    throw "Cannot auto-detect release tag. Pass -Tag explicitly (example: -Tag v1.0.29)."
+}
+
 function Invoke-GhApi([string]$Method, [string]$Uri, $Body = $null, [string]$ContentType = "application/json") {
     $headers = @{
         Authorization = "Bearer $Token"
@@ -80,6 +97,15 @@ if (-not $Token) {
 
 if (-not $Repo) {
     $Repo = Get-RepoFromGitRemote
+}
+
+if (-not $Tag) {
+    $Tag = Resolve-DefaultTag
+    Write-Host "Auto-detected tag: $Tag"
+}
+
+if ($Tag -notmatch $TagPattern) {
+    throw "Invalid tag format: $Tag. Expected vX.Y.Z (for example: v1.0.29)."
 }
 
 $releaseDir = Join-Path $repoRoot "firmware\$Tag"
