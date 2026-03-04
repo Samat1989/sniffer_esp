@@ -34,6 +34,13 @@
 
 #define CLK_GPIO CONFIG_SNIFFER_CLK_GPIO
 #define DATA_GPIO CONFIG_SNIFFER_DATA_GPIO
+#define DIGIT0_GPIO CONFIG_SNIFFER_DIGIT0_GPIO
+#define DIGIT1_GPIO CONFIG_SNIFFER_DIGIT1_GPIO
+#ifdef CONFIG_SNIFFER_DIGIT2_GPIO
+#define DIGIT2_GPIO CONFIG_SNIFFER_DIGIT2_GPIO
+#else
+#define DIGIT2_GPIO 23
+#endif
 #define FRAME_GAP_US CONFIG_SNIFFER_FRAME_GAP_US
 
 #define WIFI_SSID CONFIG_SNIFFER_WIFI_SSID
@@ -41,6 +48,7 @@
 #define OTA_URL CONFIG_SNIFFER_OTA_FIRMWARE_URL
 
 #define MAX_FRAME_BITS 64
+#define CONTINUOUS_FLUSH_BITS 16
 #define EVENT_QUEUE_LEN 256
 #define MAX_MUX_SLOTS 8
 #define MUX_DIGIT_STALE_US (500LL * 1000LL)
@@ -66,6 +74,9 @@
 
 typedef struct {
     uint8_t bit;
+    uint8_t digit0;
+    uint8_t digit1;
+    uint8_t digit2;
     int64_t ts_us;
 } bit_event_t;
 
@@ -84,11 +95,17 @@ static char s_last_raw[96];
 static char s_last_hex[64];
 static char s_last_decoded[16];
 static char s_last_decode_status[24];
+static uint8_t s_last_led_byte;
+static int64_t s_last_led_us;
+static bool s_last_led_valid;
 static int64_t s_last_frame_us;
 static bool s_last_decode_ok;
 static int s_mux_digit[MAX_MUX_SLOTS];
 static bool s_mux_valid[MAX_MUX_SLOTS];
 static int64_t s_mux_seen_us[MAX_MUX_SLOTS];
+static int s_gpio_mux_digit[2][2];
+static bool s_gpio_mux_valid[2][2];
+static int64_t s_gpio_mux_seen_us[2][2];
 static bool s_prev_single_valid;
 static uint8_t s_prev_single_byte;
 static int64_t s_prev_single_ts_us;
@@ -287,6 +304,112 @@ static bool build_mux_2digit(char *decoded, size_t decoded_len)
     return false;
 }
 
+static int selector_state_from_samples(const uint8_t *digit0_levels, const uint8_t *digit1_levels, int nbits, int *dominant_count)
+{
+    int counts[4] = {0};
+    for (int i = 0; i < nbits; ++i) {
+        int state = ((digit0_levels[i] & 0x01) << 1) | (digit1_levels[i] & 0x01);
+        counts[state]++;
+    }
+
+    int best_state = 0;
+    int best_count = counts[0];
+    for (int s = 1; s < 4; ++s) {
+        if (counts[s] > best_count) {
+            best_count = counts[s];
+            best_state = s;
+        }
+    }
+
+    if (dominant_count) {
+        *dominant_count = best_count;
+    }
+    return best_state;
+}
+
+static int dominant_level_from_samples(const uint8_t *levels, int nbits, int *dominant_count)
+{
+    int ones = 0;
+    for (int i = 0; i < nbits; ++i) {
+        ones += (levels[i] & 0x01);
+    }
+    int zeros = nbits - ones;
+    if (dominant_count) {
+        *dominant_count = (ones >= zeros) ? ones : zeros;
+    }
+    return (ones >= zeros) ? 1 : 0;
+}
+
+static bool selector3_slot_from_levels(int sel0, int sel1, int sel2, int *slot, bool *active_low)
+{
+    if (sel0 == 0 && sel1 == 1 && sel2 == 1) {
+        *slot = 0;
+        *active_low = true;
+        return true;
+    }
+    if (sel0 == 1 && sel1 == 0 && sel2 == 1) {
+        *slot = 1;
+        *active_low = true;
+        return true;
+    }
+    if (sel0 == 1 && sel1 == 1 && sel2 == 0) {
+        *slot = 2;
+        *active_low = true;
+        return true;
+    }
+    if (sel0 == 1 && sel1 == 0 && sel2 == 0) {
+        *slot = 0;
+        *active_low = false;
+        return true;
+    }
+    if (sel0 == 0 && sel1 == 1 && sel2 == 0) {
+        *slot = 1;
+        *active_low = false;
+        return true;
+    }
+    if (sel0 == 0 && sel1 == 0 && sel2 == 1) {
+        *slot = 2;
+        *active_low = false;
+        return true;
+    }
+    return false;
+}
+
+static bool selector_slots_from_state(int state, int *low_slot, int *high_slot)
+{
+    if (state == 0x1) { // digit0=0, digit1=1
+        *low_slot = 0;
+        *high_slot = 1;
+        return true;
+    }
+    if (state == 0x2) { // digit0=1, digit1=0
+        *low_slot = 1;
+        *high_slot = 0;
+        return true;
+    }
+    return false;
+}
+
+static bool build_gpio_mux_2digit(int polarity_idx, char *decoded, size_t decoded_len)
+{
+    int64_t now = esp_timer_get_time();
+    if (polarity_idx < 0 || polarity_idx > 1) {
+        return false;
+    }
+
+    for (int slot = 0; slot < 2; ++slot) {
+        if (!s_gpio_mux_valid[polarity_idx][slot]) {
+            return false;
+        }
+        if ((now - s_gpio_mux_seen_us[polarity_idx][slot]) > MUX_DIGIT_STALE_US) {
+            return false;
+        }
+    }
+
+    snprintf(decoded, decoded_len, "%d%d", s_gpio_mux_digit[polarity_idx][0], s_gpio_mux_digit[polarity_idx][1]);
+    return true;
+}
+
 static int decode_status_rank(const char *status)
 {
     if (!status) {
@@ -296,6 +419,9 @@ static int decode_status_rank(const char *status)
         return 4;
     }
     if (strncmp(status, "partial(mux)", 12) == 0) {
+        return 3;
+    }
+    if (strncmp(status, "partial(mux_gpio)", 17) == 0) {
         return 3;
     }
     if (strncmp(status, "partial(single)", 15) == 0) {
@@ -569,20 +695,38 @@ static void build_decoded_reply(char *out, size_t out_len)
 {
     char decoded[16] = {0};
     char decode_status[24] = {0};
+    uint8_t led_byte = 0;
+    int64_t led_us = 0;
+    bool led_valid = false;
     int64_t frame_us = 0;
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     strncpy(decoded, s_last_decoded, sizeof(decoded) - 1);
     strncpy(decode_status, s_last_decode_status, sizeof(decode_status) - 1);
+    led_byte = s_last_led_byte;
+    led_us = s_last_led_us;
+    led_valid = s_last_led_valid;
     frame_us = s_last_frame_us;
     xSemaphoreGive(s_state_mutex);
 
-    int64_t age_us = esp_timer_get_time() - frame_us;
-    if (frame_us > 0 && age_us <= STATUS_STALE_US && strncmp(decode_status, "ok(", 3) == 0) {
-        snprintf(out, out_len, "%s", decoded);
-    } else {
-        snprintf(out, out_len, "unknown");
+    int64_t now_us = esp_timer_get_time();
+    int64_t age_us = now_us - frame_us;
+    bool decode_fresh = (frame_us > 0 && age_us <= STATUS_STALE_US && strncmp(decode_status, "ok(", 3) == 0);
+    bool led_fresh = (led_valid && led_us > 0 && (now_us - led_us) <= STATUS_STALE_US);
+
+    if (decode_fresh && led_fresh) {
+        snprintf(out, out_len, "%s led=%u", decoded, (unsigned)led_byte);
+        return;
     }
+    if (decode_fresh) {
+        snprintf(out, out_len, "%s", decoded);
+        return;
+    }
+    if (led_fresh) {
+        snprintf(out, out_len, "unknown led=%u", (unsigned)led_byte);
+        return;
+    }
+    snprintf(out, out_len, "unknown");
 }
 
 static void build_fw_version_reply(char *out, size_t out_len)
@@ -726,7 +870,11 @@ static void telegram_poll_and_respond(int64_t *next_offset)
 #endif
 }
 
-static void handle_frame(const uint8_t *bits, int nbits)
+static void handle_frame(const uint8_t *bits,
+                         const uint8_t *digit0_levels,
+                         const uint8_t *digit1_levels,
+                         const uint8_t *digit2_levels,
+                         int nbits)
 {
     if (nbits < 8 || (nbits % 8) != 0) {
         ESP_LOGD(TAG, "drop frame bits=%d (not byte-aligned)", nbits);
@@ -737,12 +885,24 @@ static void handle_frame(const uint8_t *bits, int nbits)
     uint8_t bytes[8] = {0};
     char hex[64];
     char decoded[16];
+    char sel_summary[40] = {0};
     const char *status;
 
     build_raw_string(bits, nbits, raw, sizeof(raw));
     int nbytes = bits_to_bytes(bits, nbits, bytes, (int)(sizeof(bytes) / sizeof(bytes[0])));
     build_hex_string(bytes, nbytes, hex, sizeof(hex));
     decode_digits(bytes, nbytes, decoded, sizeof(decoded), &status);
+
+    int dominant_count = 0;
+    int sel_state = selector_state_from_samples(digit0_levels, digit1_levels, nbits, &dominant_count);
+    int sel0 = (sel_state >> 1) & 0x01;
+    int sel1 = sel_state & 0x01;
+    int sel2_count = 0;
+    int sel2 = dominant_level_from_samples(digit2_levels, nbits, &sel2_count);
+    int sel3_slot = -1;
+    bool sel3_active_low = false;
+    bool sel3_valid = selector3_slot_from_levels(sel0, sel1, sel2, &sel3_slot, &sel3_active_low);
+    snprintf(sel_summary, sizeof(sel_summary), "%d%d%d(%d/%d|%d/%d)", sel0, sel1, sel2, dominant_count, nbits, sel2_count, nbits);
 
     if (nbytes == 1) {
         int64_t now_us = esp_timer_get_time();
@@ -765,6 +925,49 @@ static void handle_frame(const uint8_t *bits, int nbits)
         s_prev_single_valid = false;
     }
 
+    if (decode_status_rank(status) < 3 && nbytes == 1) {
+        int low_slot = -1;
+        int high_slot = -1;
+        int digit = -1;
+        decode_mode_t mode = {0};
+
+        if (selector_slots_from_state(sel_state, &low_slot, &high_slot) && decode_segment_byte(bytes[0], &digit, &mode)) {
+            int64_t now_us = esp_timer_get_time();
+            // active-low hypothesis
+            s_gpio_mux_digit[0][low_slot] = digit;
+            s_gpio_mux_valid[0][low_slot] = true;
+            s_gpio_mux_seen_us[0][low_slot] = now_us;
+            // active-high hypothesis
+            s_gpio_mux_digit[1][high_slot] = digit;
+            s_gpio_mux_valid[1][high_slot] = true;
+            s_gpio_mux_seen_us[1][high_slot] = now_us;
+
+            if (build_gpio_mux_2digit(0, decoded, sizeof(decoded))) {
+                status = "ok(mux_gpio_al)";
+            } else if (build_gpio_mux_2digit(1, decoded, sizeof(decoded))) {
+                status = "ok(mux_gpio_ah)";
+            } else {
+                snprintf(decoded, sizeof(decoded), "%d?", digit);
+                status = "partial(mux_gpio)";
+            }
+            ESP_LOGD(TAG,
+                     "mux_gpio state=%s low_slot=%d high_slot=%d digit=%d mode=%s",
+                     sel_summary,
+                     low_slot,
+                     high_slot,
+                     digit,
+                     mode_tag(mode));
+        }
+    }
+
+    if (nbytes == 1 && sel3_valid && sel3_slot == 2) {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        s_last_led_byte = bytes[0];
+        s_last_led_us = esp_timer_get_time();
+        s_last_led_valid = true;
+        xSemaphoreGive(s_state_mutex);
+    }
+
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     strncpy(s_last_raw, raw, sizeof(s_last_raw) - 1);
     strncpy(s_last_hex, hex, sizeof(s_last_hex) - 1);
@@ -774,7 +977,17 @@ static void handle_frame(const uint8_t *bits, int nbits)
     s_last_frame_us = esp_timer_get_time();
     xSemaphoreGive(s_state_mutex);
 
-    ESP_LOGD(TAG, "frame bits=%d raw=%s bytes=[%s] decoded=%s status=%s", nbits, raw, hex, decoded, status);
+    ESP_LOGD(TAG,
+             "frame bits=%d raw=%s bytes=[%s] sel=%s slot3=%d(%s) decoded=%s status=%s led=%u",
+             nbits,
+             raw,
+             hex,
+             sel_summary,
+             sel3_valid ? sel3_slot : -1,
+             sel3_valid ? (sel3_active_low ? "al" : "ah") : "na",
+             decoded,
+             status,
+             (unsigned)s_last_led_byte);
 }
 
 static gap_kind_t classify_gap_kind(int64_t dt_us)
@@ -868,6 +1081,23 @@ static void handle_cycle_decode(const cycle_state_t *cycle)
              status);
 }
 
+static void flush_frame_buffer(const uint8_t *bits,
+                               const uint8_t *digit0_levels,
+                               const uint8_t *digit1_levels,
+                               const uint8_t *digit2_levels,
+                               int nbits,
+                               cycle_state_t *cycle,
+                               gap_kind_t gap_kind,
+                               int64_t frame_ts_us)
+{
+    handle_frame(bits, digit0_levels, digit1_levels, digit2_levels, nbits);
+    if ((nbits % 8) == 0) {
+        uint8_t frame_bytes[8] = {0};
+        int nbytes = bits_to_bytes(bits, nbits, frame_bytes, (int)(sizeof(frame_bytes) / sizeof(frame_bytes[0])));
+        cycle_add_subframe(cycle, frame_bytes, nbytes, gap_kind, frame_ts_us);
+    }
+}
+
 static int64_t effective_gap_us_from_timing(const timing_stats_t *ts)
 {
     int64_t gap_us = FRAME_GAP_US;
@@ -945,6 +1175,9 @@ static void sniffer_task(void *arg)
     (void)arg;
     bit_event_t ev;
     uint8_t bits[MAX_FRAME_BITS] = {0};
+    uint8_t digit0_levels[MAX_FRAME_BITS] = {0};
+    uint8_t digit1_levels[MAX_FRAME_BITS] = {0};
+    uint8_t digit2_levels[MAX_FRAME_BITS] = {0};
     int nbits = 0;
     int64_t last_ts = 0;
     timing_stats_t t = {0};
@@ -963,12 +1196,7 @@ static void sniffer_task(void *arg)
             }
 
             if (nbits > 0 && (ev.ts_us - last_ts) > gap_us) {
-                handle_frame(bits, nbits);
-                if ((nbits % 8) == 0) {
-                    uint8_t frame_bytes[8] = {0};
-                    int nbytes = bits_to_bytes(bits, nbits, frame_bytes, (int)(sizeof(frame_bytes) / sizeof(frame_bytes[0])));
-                    cycle_add_subframe(&cycle, frame_bytes, nbytes, gap_kind, last_ts);
-                }
+                flush_frame_buffer(bits, digit0_levels, digit1_levels, digit2_levels, nbits, &cycle, gap_kind, last_ts);
 
                 if (gap_kind == GAP_LONG) {
                     handle_cycle_decode(&cycle);
@@ -979,14 +1207,18 @@ static void sniffer_task(void *arg)
 
             if (nbits < MAX_FRAME_BITS) {
                 bits[nbits++] = ev.bit;
+                digit0_levels[nbits - 1] = ev.digit0;
+                digit1_levels[nbits - 1] = ev.digit1;
+                digit2_levels[nbits - 1] = ev.digit2;
             } else {
                 ESP_LOGW(TAG, "frame overflow, force flush bits=%d", nbits);
-                handle_frame(bits, nbits);
-                if ((nbits % 8) == 0) {
-                    uint8_t frame_bytes[8] = {0};
-                    int nbytes = bits_to_bytes(bits, nbits, frame_bytes, (int)(sizeof(frame_bytes) / sizeof(frame_bytes[0])));
-                    cycle_add_subframe(&cycle, frame_bytes, nbytes, GAP_NONE, last_ts);
-                }
+                flush_frame_buffer(bits, digit0_levels, digit1_levels, digit2_levels, nbits, &cycle, GAP_NONE, last_ts);
+                nbits = 0;
+            }
+
+            if (gap_kind == GAP_NONE && nbits == CONTINUOUS_FLUSH_BITS) {
+                // For continuous transfers without inter-frame gap, emit 2-byte chunks.
+                flush_frame_buffer(bits, digit0_levels, digit1_levels, digit2_levels, nbits, &cycle, GAP_NONE, ev.ts_us);
                 nbits = 0;
             }
             last_ts = ev.ts_us;
@@ -994,12 +1226,7 @@ static void sniffer_task(void *arg)
             int64_t gap_us = effective_gap_us_from_timing(&t);
             int64_t idle_us = esp_timer_get_time() - last_ts;
             if (idle_us > gap_us) {
-                handle_frame(bits, nbits);
-                if ((nbits % 8) == 0) {
-                    uint8_t frame_bytes[8] = {0};
-                    int nbytes = bits_to_bytes(bits, nbits, frame_bytes, (int)(sizeof(frame_bytes) / sizeof(frame_bytes[0])));
-                    cycle_add_subframe(&cycle, frame_bytes, nbytes, GAP_NONE, last_ts);
-                }
+                flush_frame_buffer(bits, digit0_levels, digit1_levels, digit2_levels, nbits, &cycle, GAP_NONE, last_ts);
                 nbits = 0;
             }
             if (idle_us > PAUSE_LONG_US) {
@@ -1015,6 +1242,9 @@ static void IRAM_ATTR clk_isr_handler(void *arg)
     (void)arg;
     bit_event_t ev;
     ev.bit = (uint8_t)gpio_level_fast((gpio_num_t)DATA_GPIO);
+    ev.digit0 = (uint8_t)gpio_level_fast((gpio_num_t)DIGIT0_GPIO);
+    ev.digit1 = (uint8_t)gpio_level_fast((gpio_num_t)DIGIT1_GPIO);
+    ev.digit2 = (uint8_t)gpio_level_fast((gpio_num_t)DIGIT2_GPIO);
     ev.ts_us = esp_timer_get_time();
 
     BaseType_t hp_task_woken = pdFALSE;
@@ -1208,6 +1438,15 @@ static void sniffer_gpio_init(void)
     };
     ESP_ERROR_CHECK(gpio_config(&data_cfg));
 
+    gpio_config_t digit_cfg = {
+        .pin_bit_mask = (1ULL << DIGIT0_GPIO) | (1ULL << DIGIT1_GPIO) | (1ULL << DIGIT2_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&digit_cfg));
+
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_IRAM));
     ESP_ERROR_CHECK(gpio_isr_handler_add(CLK_GPIO, clk_isr_handler, NULL));
 }
@@ -1222,7 +1461,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_err);
 
-    ESP_LOGI(TAG, "sniffer start, clk=%d data=%d gap_us=%d", CLK_GPIO, DATA_GPIO, FRAME_GAP_US);
+    ESP_LOGI(TAG,
+             "sniffer start, clk=%d data=%d digit0=%d digit1=%d digit2=%d gap_us=%d",
+             CLK_GPIO,
+             DATA_GPIO,
+             DIGIT0_GPIO,
+             DIGIT1_GPIO,
+             DIGIT2_GPIO,
+             FRAME_GAP_US);
 
     s_bit_queue = xQueueCreate(EVENT_QUEUE_LEN, sizeof(bit_event_t));
     if (!s_bit_queue) {

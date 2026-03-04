@@ -8,6 +8,18 @@ config SNIFFER_DATA_GPIO
     int "DATA input GPIO"
     default 19
 
+config SNIFFER_DIGIT0_GPIO
+    int "DIGIT0 select input GPIO"
+    default 21
+
+config SNIFFER_DIGIT1_GPIO
+    int "DIGIT1 select input GPIO"
+    default 22
+
+config SNIFFER_DIGIT2_GPIO
+    int "DIGIT2/aux input GPIO"
+    default 23
+
 config SNIFFER_FRAME_GAP_US
     int "Frame gap in microseconds"
     default 2500
