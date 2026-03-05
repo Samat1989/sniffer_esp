@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -743,12 +744,19 @@ static bool telegram_send_text(const char *chat_id, const char *text)
     char url[256];
     snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage", CONFIG_SNIFFER_TELEGRAM_BOT_TOKEN);
 
-    char escaped_text[1900];
-    json_escape_text(text, escaped_text, sizeof(escaped_text));
+    char *escaped_text = (char *)malloc(1900);
+    char *body = (char *)malloc(2200);
+    if (!escaped_text || !body) {
+        free(escaped_text);
+        free(body);
+        ESP_LOGW(TAG, "telegram send alloc failed");
+        return false;
+    }
 
-    char body[2200];
+    json_escape_text(text, escaped_text, 1900);
+
     snprintf(body,
-             sizeof(body),
+             2200,
              "{\"chat_id\":\"%s\",\"text\":\"%s\"}",
              chat_id ? chat_id : "",
              escaped_text);
@@ -764,6 +772,8 @@ static bool telegram_send_text(const char *chat_id, const char *text)
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
+        free(escaped_text);
+        free(body);
         return false;
     }
 
@@ -773,6 +783,8 @@ static bool telegram_send_text(const char *chat_id, const char *text)
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+    free(escaped_text);
+    free(body);
 
     if (!(err == ESP_OK && status == 200)) {
         ESP_LOGW(TAG, "telegram send failed err=%s status=%d", esp_err_to_name(err), status);
@@ -1091,13 +1103,21 @@ static void telegram_poll_and_respond(int64_t *next_offset)
              TELEGRAM_POLL_TIMEOUT_S,
              (long long)*next_offset);
 
-    char response[TELEGRAM_RESP_MAX];
-    if (!telegram_http_get(url, response, sizeof(response))) {
+    char *response = (char *)malloc(TELEGRAM_RESP_MAX);
+    if (!response) {
+        ESP_LOGW(TAG, "telegram getUpdates alloc failed");
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        return;
+    }
+
+    if (!telegram_http_get(url, response, TELEGRAM_RESP_MAX)) {
+        free(response);
         vTaskDelay(pdMS_TO_TICKS(1500));
         return;
     }
 
     cJSON *root = cJSON_Parse(response);
+    free(response);
     if (!root) {
         ESP_LOGW(TAG, "telegram parse failed");
         return;
