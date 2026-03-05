@@ -333,6 +333,44 @@ static bool build_mux_2digit(char *decoded, size_t decoded_len)
     return false;
 }
 
+// Build two digits using latest observed selector order (from /order detector).
+// This helps when slot indices are not naturally ordered as left->right.
+static bool build_ordered_mux_2digit(char *decoded, size_t decoded_len)
+{
+    pin_order_state_t order = {0};
+    portENTER_CRITICAL(&s_order_spinlock);
+    order = s_order_state;
+    portEXIT_CRITICAL(&s_order_spinlock);
+
+    if (!order.last_valid) {
+        return false;
+    }
+
+    int64_t now = esp_timer_get_time();
+    int picked[2] = {-1, -1};
+    int n = 0;
+    for (int i = 0; i < ORDER_PINS_COUNT && n < 2; ++i) {
+        int slot = (int)order.last_order[i];
+        if (slot < 0 || slot >= MAX_MUX_SLOTS) {
+            continue;
+        }
+        if (!s_mux_valid[slot]) {
+            continue;
+        }
+        if ((now - s_mux_seen_us[slot]) > MUX_DIGIT_STALE_US) {
+            continue;
+        }
+        picked[n++] = slot;
+    }
+
+    if (n < 2) {
+        return false;
+    }
+
+    snprintf(decoded, decoded_len, "%d%d", s_mux_digit[picked[0]], s_mux_digit[picked[1]]);
+    return true;
+}
+
 static int selector_state_from_samples(const uint8_t *digit0_levels, const uint8_t *digit1_levels, int nbits, int *dominant_count)
 {
     int counts[4] = {0};
@@ -1083,7 +1121,9 @@ static void handle_frame(const uint8_t *bits,
                 s_mux_digit[slot_hint] = d;
                 s_mux_valid[slot_hint] = true;
                 s_mux_seen_us[slot_hint] = esp_timer_get_time();
-                if (build_mux_2digit(decoded, sizeof(decoded))) {
+                if (build_ordered_mux_2digit(decoded, sizeof(decoded))) {
+                    status = "ok(slot_order)";
+                } else if (build_mux_2digit(decoded, sizeof(decoded))) {
                     status = "ok(slot)";
                 } else {
                     snprintf(decoded, sizeof(decoded), "%d?", d);
