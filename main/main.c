@@ -738,7 +738,7 @@ static void build_fw_version_reply(char *out, size_t out_len)
 
 static void send_temp_series(const char *chat_id)
 {
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 2; ++i) {
         char reply[96];
         build_decoded_reply(reply, sizeof(reply));
         if (!telegram_send_text(chat_id, reply)) {
