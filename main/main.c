@@ -888,6 +888,22 @@ static void send_frame_history(const char *chat_id)
     }
 }
 
+// Accepts "/cmd", "/cmd@botname" and "/cmd anything".
+static bool telegram_cmd_is(const char *text, const char *cmd)
+{
+    if (!text || !cmd) {
+        return false;
+    }
+
+    size_t cmd_len = strlen(cmd);
+    if (strncmp(text, cmd, cmd_len) != 0) {
+        return false;
+    }
+
+    char tail = text[cmd_len];
+    return (tail == '\0' || tail == ' ' || tail == '\t' || tail == '\r' || tail == '\n' || tail == '@');
+}
+
 // One-hot active-low selector lines: returns active slot 0..2, otherwise -1.
 static int active_slot_from_levels(uint8_t d0, uint8_t d1, uint8_t d2)
 {
@@ -1044,13 +1060,13 @@ static void telegram_poll_and_respond(int64_t *next_offset)
             continue;
         }
 
-        bool cmd_status = (strcmp(text->valuestring, "/status") == 0);
-        bool cmd_get_temp = (strcmp(text->valuestring, "/get_temp") == 0);
-        bool cmd_order = (strcmp(text->valuestring, "/order") == 0);
-        bool cmd_clkdata = (strcmp(text->valuestring, "/clkdata") == 0);
-        bool cmd_frames = (strcmp(text->valuestring, "/frames") == 0);
-        bool cmd_update = (strcmp(text->valuestring, "/update") == 0);
-        bool cmd_ota_legacy = (strcmp(text->valuestring, "/ota") == 0);
+        bool cmd_status = telegram_cmd_is(text->valuestring, "/status");
+        bool cmd_get_temp = telegram_cmd_is(text->valuestring, "/get_temp");
+        bool cmd_order = telegram_cmd_is(text->valuestring, "/order");
+        bool cmd_clkdata = telegram_cmd_is(text->valuestring, "/clkdata");
+        bool cmd_frames = telegram_cmd_is(text->valuestring, "/frames");
+        bool cmd_update = telegram_cmd_is(text->valuestring, "/update");
+        bool cmd_ota_legacy = telegram_cmd_is(text->valuestring, "/ota");
         if (!cmd_status && !cmd_get_temp && !cmd_order && !cmd_clkdata && !cmd_frames && !cmd_update && !cmd_ota_legacy) {
             continue;
         }
