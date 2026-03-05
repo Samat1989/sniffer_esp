@@ -60,6 +60,8 @@
 #define PAUSE_MID_US 11000
 #define PAUSE_LONG_US 18000
 #define MAX_CYCLE_BYTES 96
+#define ORDER_PINS_COUNT 3
+#define ORDER_TIMEOUT_US (50LL * 1000LL)
 
 #define TELEGRAM_POLL_TIMEOUT_S 5
 #define TELEGRAM_RESP_MAX 2048
@@ -146,6 +148,22 @@ typedef struct {
     int64_t start_ts_us;
     int64_t last_ts_us;
 } cycle_state_t;
+
+typedef struct {
+    uint32_t events;
+    uint32_t cycles;
+    uint32_t timeouts;
+    bool last_valid;
+    uint8_t last_order[ORDER_PINS_COUNT];
+    int64_t last_cycle_us;
+    uint8_t curr_order[ORDER_PINS_COUNT];
+    bool seen[ORDER_PINS_COUNT];
+    uint8_t curr_count;
+    int64_t last_event_us;
+} pin_order_state_t;
+
+static portMUX_TYPE s_order_spinlock = portMUX_INITIALIZER_UNLOCKED;
+static pin_order_state_t s_order_state;
 
 static int64_t telegram_load_next_offset(void)
 {
@@ -752,6 +770,52 @@ static void send_temp_series(const char *chat_id)
     }
 }
 
+static const char *order_pin_name(uint8_t idx)
+{
+    if (idx == 0) {
+        return "d0";
+    }
+    if (idx == 1) {
+        return "d1";
+    }
+    if (idx == 2) {
+        return "d2";
+    }
+    return "?";
+}
+
+static void build_order_reply(char *out, size_t out_len)
+{
+    pin_order_state_t snap = {0};
+    portENTER_CRITICAL(&s_order_spinlock);
+    snap = s_order_state;
+    portEXIT_CRITICAL(&s_order_spinlock);
+
+    if (!snap.last_valid) {
+        snprintf(out,
+                 out_len,
+                 "order: no full cycle yet, events=%u timeouts=%u",
+                 (unsigned)snap.events,
+                 (unsigned)snap.timeouts);
+        return;
+    }
+
+    int64_t age_ms = 0;
+    if (snap.last_cycle_us > 0) {
+        age_ms = (esp_timer_get_time() - snap.last_cycle_us) / 1000;
+    }
+
+    snprintf(out,
+             out_len,
+             "order: %s->%s->%s age=%lldms cycles=%u events=%u",
+             order_pin_name(snap.last_order[0]),
+             order_pin_name(snap.last_order[1]),
+             order_pin_name(snap.last_order[2]),
+             (long long)age_ms,
+             (unsigned)snap.cycles,
+             (unsigned)snap.events);
+}
+
 static void telegram_poll_and_respond(int64_t *next_offset)
 {
 #if CONFIG_SNIFFER_ENABLE_TELEGRAM
@@ -810,9 +874,10 @@ static void telegram_poll_and_respond(int64_t *next_offset)
 
         bool cmd_status = (strcmp(text->valuestring, "/status") == 0);
         bool cmd_get_temp = (strcmp(text->valuestring, "/get_temp") == 0);
+        bool cmd_order = (strcmp(text->valuestring, "/order") == 0);
         bool cmd_update = (strcmp(text->valuestring, "/update") == 0);
         bool cmd_ota_legacy = (strcmp(text->valuestring, "/ota") == 0);
-        if (!cmd_status && !cmd_get_temp && !cmd_update && !cmd_ota_legacy) {
+        if (!cmd_status && !cmd_get_temp && !cmd_order && !cmd_update && !cmd_ota_legacy) {
             continue;
         }
 
@@ -843,6 +908,15 @@ static void telegram_poll_and_respond(int64_t *next_offset)
 
         if (cmd_get_temp) {
             send_temp_series(chat_id_str);
+            continue;
+        }
+
+        if (cmd_order) {
+            char reply[128];
+            build_order_reply(reply, sizeof(reply));
+            if (!telegram_send_text(chat_id_str, reply)) {
+                ESP_LOGW(TAG, "telegram send failed");
+            }
             continue;
         }
 
@@ -1254,6 +1328,42 @@ static void IRAM_ATTR clk_isr_handler(void *arg)
     }
 }
 
+static void IRAM_ATTR order_isr_handler(void *arg)
+{
+    uint32_t idx = (uint32_t)arg;
+    if (idx >= ORDER_PINS_COUNT) {
+        return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL_ISR(&s_order_spinlock);
+    s_order_state.events++;
+
+    if (s_order_state.last_event_us > 0 && (now_us - s_order_state.last_event_us) > ORDER_TIMEOUT_US) {
+        memset(s_order_state.seen, 0, sizeof(s_order_state.seen));
+        s_order_state.curr_count = 0;
+        s_order_state.timeouts++;
+    }
+    s_order_state.last_event_us = now_us;
+
+    if (!s_order_state.seen[idx]) {
+        s_order_state.seen[idx] = true;
+        s_order_state.curr_order[s_order_state.curr_count++] = (uint8_t)idx;
+
+        if (s_order_state.curr_count == ORDER_PINS_COUNT) {
+            for (int i = 0; i < ORDER_PINS_COUNT; ++i) {
+                s_order_state.last_order[i] = s_order_state.curr_order[i];
+            }
+            s_order_state.last_valid = true;
+            s_order_state.last_cycle_us = now_us;
+            s_order_state.cycles++;
+            memset(s_order_state.seen, 0, sizeof(s_order_state.seen));
+            s_order_state.curr_count = 0;
+        }
+    }
+    portEXIT_CRITICAL_ISR(&s_order_spinlock);
+}
+
 static bool ip4_addr_is_zero(const esp_ip4_addr_t *addr)
 {
     return addr && (addr->addr == 0);
@@ -1443,12 +1553,15 @@ static void sniffer_gpio_init(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE,
     };
     ESP_ERROR_CHECK(gpio_config(&digit_cfg));
 
     ESP_ERROR_CHECK(gpio_install_isr_service(ESP_INTR_FLAG_IRAM));
     ESP_ERROR_CHECK(gpio_isr_handler_add(CLK_GPIO, clk_isr_handler, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(DIGIT0_GPIO, order_isr_handler, (void *)0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(DIGIT1_GPIO, order_isr_handler, (void *)1));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(DIGIT2_GPIO, order_isr_handler, (void *)2));
 }
 
 void app_main(void)
