@@ -770,6 +770,21 @@ static void send_temp_series(const char *chat_id)
     }
 }
 
+// One-hot active-low selector lines: returns active slot 0..2, otherwise -1.
+static int active_slot_from_levels(uint8_t d0, uint8_t d1, uint8_t d2)
+{
+    if (d0 == 0 && d1 == 1 && d2 == 1) {
+        return 0;
+    }
+    if (d0 == 1 && d1 == 0 && d2 == 1) {
+        return 1;
+    }
+    if (d0 == 1 && d1 == 1 && d2 == 0) {
+        return 2;
+    }
+    return -1;
+}
+
 static const char *order_pin_name(uint8_t idx)
 {
     if (idx == 0) {
@@ -948,6 +963,7 @@ static void handle_frame(const uint8_t *bits,
                          const uint8_t *digit0_levels,
                          const uint8_t *digit1_levels,
                          const uint8_t *digit2_levels,
+                         int slot_hint,
                          int nbits)
 {
     if (nbits < 8 || (nbits % 8) != 0) {
@@ -1000,6 +1016,22 @@ static void handle_frame(const uint8_t *bits,
     }
 
     if (decode_status_rank(status) < 3 && nbytes == 1) {
+        if (slot_hint >= 0 && slot_hint < MAX_MUX_SLOTS) {
+            int d = -1;
+            decode_mode_t mode = {0};
+            if (decode_segment_byte(bytes[0], &d, &mode)) {
+                s_mux_digit[slot_hint] = d;
+                s_mux_valid[slot_hint] = true;
+                s_mux_seen_us[slot_hint] = esp_timer_get_time();
+                if (build_mux_2digit(decoded, sizeof(decoded))) {
+                    status = "ok(slot)";
+                } else {
+                    snprintf(decoded, sizeof(decoded), "%d?", d);
+                    status = "partial(slot)";
+                }
+            }
+        }
+
         int low_slot = -1;
         int high_slot = -1;
         int digit = -1;
@@ -1057,7 +1089,7 @@ static void handle_frame(const uint8_t *bits,
              raw,
              hex,
              sel_summary,
-             sel3_valid ? sel3_slot : -1,
+             (slot_hint >= 0) ? slot_hint : (sel3_valid ? sel3_slot : -1),
              sel3_valid ? (sel3_active_low ? "al" : "ah") : "na",
              decoded,
              status,
@@ -1162,9 +1194,10 @@ static void flush_frame_buffer(const uint8_t *bits,
                                int nbits,
                                cycle_state_t *cycle,
                                gap_kind_t gap_kind,
-                               int64_t frame_ts_us)
+                               int64_t frame_ts_us,
+                               int slot_hint)
 {
-    handle_frame(bits, digit0_levels, digit1_levels, digit2_levels, nbits);
+    handle_frame(bits, digit0_levels, digit1_levels, digit2_levels, slot_hint, nbits);
     if ((nbits % 8) == 0) {
         uint8_t frame_bytes[8] = {0};
         int nbytes = bits_to_bytes(bits, nbits, frame_bytes, (int)(sizeof(frame_bytes) / sizeof(frame_bytes[0])));
@@ -1256,12 +1289,14 @@ static void sniffer_task(void *arg)
     int64_t last_ts = 0;
     timing_stats_t t = {0};
     cycle_state_t cycle = {0};
+    int current_slot = -1;
 
     while (1) {
         if (xQueueReceive(s_bit_queue, &ev, pdMS_TO_TICKS(1000)) == pdTRUE) {
             int64_t gap_us = effective_gap_us_from_timing(&t);
             gap_kind_t gap_kind = GAP_NONE;
             int64_t dt_us = 0;
+            int event_slot = active_slot_from_levels(ev.digit0, ev.digit1, ev.digit2);
             if (last_ts > 0) {
                 dt_us = ev.ts_us - last_ts;
                 update_timing_stats(&t, dt_us, gap_us);
@@ -1269,14 +1304,44 @@ static void sniffer_task(void *arg)
                 gap_kind = classify_gap_kind(dt_us);
             }
 
+            if (nbits > 0 && current_slot >= 0 && event_slot != current_slot) {
+                flush_frame_buffer(bits,
+                                   digit0_levels,
+                                   digit1_levels,
+                                   digit2_levels,
+                                   nbits,
+                                   &cycle,
+                                   GAP_NONE,
+                                   last_ts,
+                                   current_slot);
+                nbits = 0;
+            }
+
             if (nbits > 0 && (ev.ts_us - last_ts) > gap_us) {
-                flush_frame_buffer(bits, digit0_levels, digit1_levels, digit2_levels, nbits, &cycle, gap_kind, last_ts);
+                flush_frame_buffer(bits,
+                                   digit0_levels,
+                                   digit1_levels,
+                                   digit2_levels,
+                                   nbits,
+                                   &cycle,
+                                   gap_kind,
+                                   last_ts,
+                                   current_slot);
 
                 if (gap_kind == GAP_LONG) {
                     handle_cycle_decode(&cycle);
                     cycle_reset(&cycle);
                 }
                 nbits = 0;
+            }
+
+            if (event_slot >= 0) {
+                current_slot = event_slot;
+            }
+
+            if (current_slot < 0) {
+                last_ts = ev.ts_us;
+                continue;
             }
 
             if (nbits < MAX_FRAME_BITS) {
@@ -1286,13 +1351,29 @@ static void sniffer_task(void *arg)
                 digit2_levels[nbits - 1] = ev.digit2;
             } else {
                 ESP_LOGW(TAG, "frame overflow, force flush bits=%d", nbits);
-                flush_frame_buffer(bits, digit0_levels, digit1_levels, digit2_levels, nbits, &cycle, GAP_NONE, last_ts);
+                flush_frame_buffer(bits,
+                                   digit0_levels,
+                                   digit1_levels,
+                                   digit2_levels,
+                                   nbits,
+                                   &cycle,
+                                   GAP_NONE,
+                                   last_ts,
+                                   current_slot);
                 nbits = 0;
             }
 
             if (gap_kind == GAP_NONE && nbits == CONTINUOUS_FLUSH_BITS) {
                 // For continuous transfers without inter-frame gap, emit 2-byte chunks.
-                flush_frame_buffer(bits, digit0_levels, digit1_levels, digit2_levels, nbits, &cycle, GAP_NONE, ev.ts_us);
+                flush_frame_buffer(bits,
+                                   digit0_levels,
+                                   digit1_levels,
+                                   digit2_levels,
+                                   nbits,
+                                   &cycle,
+                                   GAP_NONE,
+                                   ev.ts_us,
+                                   current_slot);
                 nbits = 0;
             }
             last_ts = ev.ts_us;
@@ -1300,8 +1381,17 @@ static void sniffer_task(void *arg)
             int64_t gap_us = effective_gap_us_from_timing(&t);
             int64_t idle_us = esp_timer_get_time() - last_ts;
             if (idle_us > gap_us) {
-                flush_frame_buffer(bits, digit0_levels, digit1_levels, digit2_levels, nbits, &cycle, GAP_NONE, last_ts);
+                flush_frame_buffer(bits,
+                                   digit0_levels,
+                                   digit1_levels,
+                                   digit2_levels,
+                                   nbits,
+                                   &cycle,
+                                   GAP_NONE,
+                                   last_ts,
+                                   current_slot);
                 nbits = 0;
+                current_slot = -1;
             }
             if (idle_us > PAUSE_LONG_US) {
                 handle_cycle_decode(&cycle);
