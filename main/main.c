@@ -51,6 +51,8 @@
 #define CONTINUOUS_FLUSH_BITS 16
 #define EVENT_QUEUE_LEN 256
 #define MAX_MUX_SLOTS 8
+#define MAX_FRAME_HISTORY 30
+#define FRAME_LINE_MAX 192
 #define MUX_DIGIT_STALE_US (500LL * 1000LL)
 #define CROSS_FRAME_PAIR_US (20LL * 1000LL)
 #define AUTO_GAP_MULTIPLIER 12
@@ -111,6 +113,9 @@ static int64_t s_gpio_mux_seen_us[2][2];
 static bool s_prev_single_valid;
 static uint8_t s_prev_single_byte;
 static int64_t s_prev_single_ts_us;
+static char s_frame_history[MAX_FRAME_HISTORY][FRAME_LINE_MAX];
+static int s_frame_hist_head;
+static int s_frame_hist_count;
 
 static inline uint32_t IRAM_ATTR gpio_level_fast(gpio_num_t gpio_num)
 {
@@ -819,6 +824,70 @@ static void send_temp_series(const char *chat_id)
     }
 }
 
+static void push_frame_history_line(const char *line)
+{
+    if (!line) {
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    strncpy(s_frame_history[s_frame_hist_head], line, FRAME_LINE_MAX - 1);
+    s_frame_history[s_frame_hist_head][FRAME_LINE_MAX - 1] = '\0';
+    s_frame_hist_head = (s_frame_hist_head + 1) % MAX_FRAME_HISTORY;
+    if (s_frame_hist_count < MAX_FRAME_HISTORY) {
+        s_frame_hist_count++;
+    }
+    xSemaphoreGive(s_state_mutex);
+}
+
+static void send_frame_history(const char *chat_id)
+{
+    char snapshot[MAX_FRAME_HISTORY][FRAME_LINE_MAX] = {0};
+    int count = 0;
+    int oldest = 0;
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    count = s_frame_hist_count;
+    oldest = (s_frame_hist_head - s_frame_hist_count + MAX_FRAME_HISTORY) % MAX_FRAME_HISTORY;
+    for (int i = 0; i < count; ++i) {
+        int idx = (oldest + i) % MAX_FRAME_HISTORY;
+        strncpy(snapshot[i], s_frame_history[idx], FRAME_LINE_MAX - 1);
+        snapshot[i][FRAME_LINE_MAX - 1] = '\0';
+    }
+    xSemaphoreGive(s_state_mutex);
+
+    if (count == 0) {
+        telegram_send_text(chat_id, "frames: empty");
+        return;
+    }
+
+    char msg[1500];
+    msg[0] = '\0';
+    int chunk_start = 0;
+    for (int i = 0; i < count; ++i) {
+        char row[240];
+        snprintf(row, sizeof(row), "%02d) %s\n", i + 1, snapshot[i]);
+        if ((int)(strlen(msg) + strlen(row)) >= (int)sizeof(msg) - 1) {
+            char head[64];
+            snprintf(head, sizeof(head), "frames %d-%d/%d:\n", chunk_start + 1, i, count);
+            char out[1600];
+            snprintf(out, sizeof(out), "%s%s", head, msg);
+            telegram_send_text(chat_id, out);
+            vTaskDelay(pdMS_TO_TICKS(150));
+            msg[0] = '\0';
+            chunk_start = i;
+        }
+        strncat(msg, row, sizeof(msg) - strlen(msg) - 1);
+    }
+
+    if (msg[0] != '\0') {
+        char head[64];
+        snprintf(head, sizeof(head), "frames %d-%d/%d:\n", chunk_start + 1, count, count);
+        char out[1600];
+        snprintf(out, sizeof(out), "%s%s", head, msg);
+        telegram_send_text(chat_id, out);
+    }
+}
+
 // One-hot active-low selector lines: returns active slot 0..2, otherwise -1.
 static int active_slot_from_levels(uint8_t d0, uint8_t d1, uint8_t d2)
 {
@@ -979,9 +1048,10 @@ static void telegram_poll_and_respond(int64_t *next_offset)
         bool cmd_get_temp = (strcmp(text->valuestring, "/get_temp") == 0);
         bool cmd_order = (strcmp(text->valuestring, "/order") == 0);
         bool cmd_clkdata = (strcmp(text->valuestring, "/clkdata") == 0);
+        bool cmd_frames = (strcmp(text->valuestring, "/frames") == 0);
         bool cmd_update = (strcmp(text->valuestring, "/update") == 0);
         bool cmd_ota_legacy = (strcmp(text->valuestring, "/ota") == 0);
-        if (!cmd_status && !cmd_get_temp && !cmd_order && !cmd_clkdata && !cmd_update && !cmd_ota_legacy) {
+        if (!cmd_status && !cmd_get_temp && !cmd_order && !cmd_clkdata && !cmd_frames && !cmd_update && !cmd_ota_legacy) {
             continue;
         }
 
@@ -1030,6 +1100,11 @@ static void telegram_poll_and_respond(int64_t *next_offset)
             if (!telegram_send_text(chat_id_str, reply)) {
                 ESP_LOGW(TAG, "telegram send failed");
             }
+            continue;
+        }
+
+        if (cmd_frames) {
+            send_frame_history(chat_id_str);
             continue;
         }
 
@@ -1194,6 +1269,17 @@ static void handle_frame(const uint8_t *bits,
              decoded,
              status,
              (unsigned)s_last_led_byte);
+
+    char hist_line[FRAME_LINE_MAX];
+    snprintf(hist_line,
+             sizeof(hist_line),
+             "bits=%d bytes=[%s] sel=%s dec=%s st=%s",
+             nbits,
+             hex,
+             sel_summary,
+             decoded,
+             status);
+    push_frame_history_line(hist_line);
 }
 
 static gap_kind_t classify_gap_kind(int64_t dt_us)
