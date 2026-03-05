@@ -915,7 +915,12 @@ static void push_frame_history_line(const char *line)
 
 static void send_frame_history(const char *chat_id)
 {
-    char snapshot[MAX_FRAME_HISTORY][FRAME_LINE_MAX] = {0};
+    char *snapshot = (char *)calloc(MAX_FRAME_HISTORY, FRAME_LINE_MAX);
+    if (!snapshot) {
+        telegram_send_text(chat_id, "frames: alloc failed");
+        return;
+    }
+
     int count = 0;
     int oldest = 0;
 
@@ -924,13 +929,15 @@ static void send_frame_history(const char *chat_id)
     oldest = (s_frame_hist_head - s_frame_hist_count + MAX_FRAME_HISTORY) % MAX_FRAME_HISTORY;
     for (int i = 0; i < count; ++i) {
         int idx = (oldest + i) % MAX_FRAME_HISTORY;
-        strncpy(snapshot[i], s_frame_history[idx], FRAME_LINE_MAX - 1);
-        snapshot[i][FRAME_LINE_MAX - 1] = '\0';
+        char *dst = snapshot + ((size_t)i * FRAME_LINE_MAX);
+        strncpy(dst, s_frame_history[idx], FRAME_LINE_MAX - 1);
+        dst[FRAME_LINE_MAX - 1] = '\0';
     }
     xSemaphoreGive(s_state_mutex);
 
     if (count == 0) {
         telegram_send_text(chat_id, "frames: empty");
+        free(snapshot);
         return;
     }
 
@@ -939,7 +946,8 @@ static void send_frame_history(const char *chat_id)
     int chunk_start = 0;
     for (int i = 0; i < count; ++i) {
         char row[240];
-        snprintf(row, sizeof(row), "%02d) %s\n", i + 1, snapshot[i]);
+        char *line = snapshot + ((size_t)i * FRAME_LINE_MAX);
+        snprintf(row, sizeof(row), "%02d) %s\n", i + 1, line);
         if ((int)(strlen(msg) + strlen(row)) >= (int)sizeof(msg) - 1) {
             char head[64];
             snprintf(head, sizeof(head), "frames %d-%d/%d:\n", chunk_start + 1, i, count);
@@ -960,6 +968,8 @@ static void send_frame_history(const char *chat_id)
         snprintf(out, sizeof(out), "%s%s", head, msg);
         telegram_send_text(chat_id, out);
     }
+
+    free(snapshot);
 }
 
 static void build_frames_count_reply(char *out, size_t out_len)
@@ -2004,5 +2014,5 @@ void app_main(void)
 
     sniffer_gpio_init();
     xTaskCreate(sniffer_task, "sniffer_task", 4096, NULL, 8, NULL);
-    xTaskCreate(net_task, "net_task", 8192, NULL, 5, NULL);
+    xTaskCreate(net_task, "net_task", 12288, NULL, 5, NULL);
 }

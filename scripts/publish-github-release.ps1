@@ -2,7 +2,7 @@ param(
     [string]$Tag = "",
 
     [string]$Repo = "",
-    [string]$Token = $env:GITHUB_TOKEN
+    [string]$Token = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -98,7 +98,9 @@ function Invoke-GhApi([string]$Method, [string]$Uri, $Body = $null, [string]$Con
 }
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-if ($Token) {
+$tokenPassedExplicitly = $PSBoundParameters.ContainsKey("Token")
+
+if ($tokenPassedExplicitly -and $Token) {
     $Token = Normalize-Token $Token
 }
 
@@ -106,6 +108,10 @@ if (-not $Token) {
     $envFile = Join-Path $repoRoot ".env.local"
     $Token = Get-EnvValueFromFile -FilePath $envFile -Key "GITHUB_TOKEN"
     $Token = Normalize-Token $Token
+}
+
+if (-not $Token) {
+    $Token = Normalize-Token $env:GITHUB_TOKEN
 }
 
 if (-not $Token) {
