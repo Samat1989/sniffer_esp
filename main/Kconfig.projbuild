@@ -22,7 +22,7 @@ config SNIFFER_DIGIT2_GPIO
 
 config SNIFFER_FRAME_GAP_US
     int "Frame gap in microseconds"
-    default 2500
+    default 3500
 
 config SNIFFER_WIFI_SSID
     string "WiFi SSID"
