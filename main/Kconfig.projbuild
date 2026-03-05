@@ -2,11 +2,11 @@ menu "Sniffer Config"
 
 config SNIFFER_CLK_GPIO
     int "CLK input GPIO"
-    default 18
+    default 19
 
 config SNIFFER_DATA_GPIO
     int "DATA input GPIO"
-    default 19
+    default 18
 
 config SNIFFER_DIGIT0_GPIO
     int "DIGIT0 select input GPIO"
@@ -22,7 +22,7 @@ config SNIFFER_DIGIT2_GPIO
 
 config SNIFFER_FRAME_GAP_US
     int "Frame gap in microseconds"
-    default 3500
+    default 2500
 
 config SNIFFER_WIFI_SSID
     string "WiFi SSID"
