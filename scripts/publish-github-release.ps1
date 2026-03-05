@@ -9,6 +9,18 @@ $ErrorActionPreference = "Stop"
 
 $TagPattern = "^v[0-9]+(\.[0-9]+){1,3}([\-+][0-9A-Za-z\.\-]+)?$"
 
+function Normalize-Token([string]$Value) {
+    if ($null -eq $Value) {
+        return $null
+    }
+    # Remove CR/LF and other control chars that break HTTP header values.
+    $clean = ($Value -replace "[\x00-\x1F\x7F]", "").Trim().Trim("'`"")
+    if ($clean -eq "") {
+        return $null
+    }
+    return $clean
+}
+
 function Get-EnvValueFromFile([string]$FilePath, [string]$Key) {
     if (-not (Test-Path -LiteralPath $FilePath)) {
         return $null
@@ -86,9 +98,14 @@ function Invoke-GhApi([string]$Method, [string]$Uri, $Body = $null, [string]$Con
 }
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+if ($Token) {
+    $Token = Normalize-Token $Token
+}
+
 if (-not $Token) {
     $envFile = Join-Path $repoRoot ".env.local"
     $Token = Get-EnvValueFromFile -FilePath $envFile -Key "GITHUB_TOKEN"
+    $Token = Normalize-Token $Token
 }
 
 if (-not $Token) {

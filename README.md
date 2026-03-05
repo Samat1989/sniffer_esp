@@ -1,5 +1,6 @@
 # sniffer_esp
-
+.\scripts\release-local.ps1 -Tag vX.Y.Z
+.\scripts\publish-github-release.ps1 -Tag vX.Y.Z //скрипт для релиза
 Локальный релиз без GitHub Actions.
 
 ## 1. Один раз: подготовка
