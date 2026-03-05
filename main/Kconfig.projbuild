@@ -2,11 +2,11 @@ menu "Sniffer Config"
 
 config SNIFFER_CLK_GPIO
     int "CLK input GPIO"
-    default 19
+    default 18
 
 config SNIFFER_DATA_GPIO
     int "DATA input GPIO"
-    default 18
+    default 19
 
 config SNIFFER_DIGIT0_GPIO
     int "DIGIT0 select input GPIO"
