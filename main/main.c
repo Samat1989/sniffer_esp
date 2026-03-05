@@ -682,6 +682,57 @@ static bool telegram_http_get(const char *url, char *out, size_t out_len)
     return (err == ESP_OK && status == 200);
 }
 
+static void json_escape_text(const char *src, char *dst, size_t dst_len)
+{
+    if (!dst || dst_len == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (!src) {
+        return;
+    }
+
+    size_t w = 0;
+    for (size_t i = 0; src[i] != '\0' && w + 2 < dst_len; ++i) {
+        char c = src[i];
+        if (c == '\\' || c == '\"') {
+            if (w + 2 >= dst_len) {
+                break;
+            }
+            dst[w++] = '\\';
+            dst[w++] = c;
+            continue;
+        }
+        if (c == '\n') {
+            if (w + 2 >= dst_len) {
+                break;
+            }
+            dst[w++] = '\\';
+            dst[w++] = 'n';
+            continue;
+        }
+        if (c == '\r') {
+            if (w + 2 >= dst_len) {
+                break;
+            }
+            dst[w++] = '\\';
+            dst[w++] = 'r';
+            continue;
+        }
+        if (c == '\t') {
+            if (w + 2 >= dst_len) {
+                break;
+            }
+            dst[w++] = '\\';
+            dst[w++] = 't';
+            continue;
+        }
+
+        dst[w++] = c;
+    }
+    dst[w] = '\0';
+}
+
 static bool telegram_send_text(const char *chat_id, const char *text)
 {
 #if CONFIG_SNIFFER_ENABLE_TELEGRAM
@@ -692,8 +743,15 @@ static bool telegram_send_text(const char *chat_id, const char *text)
     char url[256];
     snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendMessage", CONFIG_SNIFFER_TELEGRAM_BOT_TOKEN);
 
-    char body[512];
-    snprintf(body, sizeof(body), "{\"chat_id\":\"%s\",\"text\":\"%s\"}", chat_id, text);
+    char escaped_text[1900];
+    json_escape_text(text, escaped_text, sizeof(escaped_text));
+
+    char body[2200];
+    snprintf(body,
+             sizeof(body),
+             "{\"chat_id\":\"%s\",\"text\":\"%s\"}",
+             chat_id ? chat_id : "",
+             escaped_text);
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -715,6 +773,10 @@ static bool telegram_send_text(const char *chat_id, const char *text)
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
+
+    if (!(err == ESP_OK && status == 200)) {
+        ESP_LOGW(TAG, "telegram send failed err=%s status=%d", esp_err_to_name(err), status);
+    }
 
     return (err == ESP_OK && status == 200);
 #else
@@ -886,6 +948,15 @@ static void send_frame_history(const char *chat_id)
         snprintf(out, sizeof(out), "%s%s", head, msg);
         telegram_send_text(chat_id, out);
     }
+}
+
+static void build_frames_count_reply(char *out, size_t out_len)
+{
+    int count = 0;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    count = s_frame_hist_count;
+    xSemaphoreGive(s_state_mutex);
+    snprintf(out, out_len, "frames_count: %d/%d", count, MAX_FRAME_HISTORY);
 }
 
 // Accepts "/cmd", "/cmd@botname" and "/cmd anything".
@@ -1065,9 +1136,11 @@ static void telegram_poll_and_respond(int64_t *next_offset)
         bool cmd_order = telegram_cmd_is(text->valuestring, "/order");
         bool cmd_clkdata = telegram_cmd_is(text->valuestring, "/clkdata");
         bool cmd_frames = telegram_cmd_is(text->valuestring, "/frames");
+        bool cmd_frames_count = telegram_cmd_is(text->valuestring, "/frames_count");
         bool cmd_update = telegram_cmd_is(text->valuestring, "/update");
         bool cmd_ota_legacy = telegram_cmd_is(text->valuestring, "/ota");
-        if (!cmd_status && !cmd_get_temp && !cmd_order && !cmd_clkdata && !cmd_frames && !cmd_update && !cmd_ota_legacy) {
+        if (!cmd_status && !cmd_get_temp && !cmd_order && !cmd_clkdata && !cmd_frames && !cmd_frames_count && !cmd_update &&
+            !cmd_ota_legacy) {
             continue;
         }
 
@@ -1121,6 +1194,15 @@ static void telegram_poll_and_respond(int64_t *next_offset)
 
         if (cmd_frames) {
             send_frame_history(chat_id_str);
+            continue;
+        }
+
+        if (cmd_frames_count) {
+            char reply[64];
+            build_frames_count_reply(reply, sizeof(reply));
+            if (!telegram_send_text(chat_id_str, reply)) {
+                ESP_LOGW(TAG, "telegram send failed");
+            }
             continue;
         }
 
