@@ -165,6 +165,17 @@ typedef struct {
 static portMUX_TYPE s_order_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static pin_order_state_t s_order_state;
 
+typedef struct {
+    uint32_t clk_edges;
+    uint32_t data_ones;
+    uint32_t data_zeros;
+    int64_t first_edge_us;
+    int64_t last_edge_us;
+} clk_data_diag_t;
+
+static portMUX_TYPE s_clk_data_spinlock = portMUX_INITIALIZER_UNLOCKED;
+static clk_data_diag_t s_clk_data_diag;
+
 static int64_t telegram_load_next_offset(void)
 {
     nvs_handle_t nvs = 0;
@@ -831,6 +842,45 @@ static void build_order_reply(char *out, size_t out_len)
              (unsigned)snap.events);
 }
 
+static void build_clkdata_reply(char *out, size_t out_len)
+{
+    clk_data_diag_t snap = {0};
+    portENTER_CRITICAL(&s_clk_data_spinlock);
+    snap = s_clk_data_diag;
+    portEXIT_CRITICAL(&s_clk_data_spinlock);
+
+    int clk_now = gpio_get_level((gpio_num_t)CLK_GPIO);
+    int data_now = gpio_get_level((gpio_num_t)DATA_GPIO);
+
+    if (snap.clk_edges == 0 || snap.first_edge_us == 0 || snap.last_edge_us <= snap.first_edge_us) {
+        snprintf(out,
+                 out_len,
+                 "clkdata: no edges yet clk=%d data=%d",
+                 clk_now,
+                 data_now);
+        return;
+    }
+
+    int64_t span_us = snap.last_edge_us - snap.first_edge_us;
+    uint32_t edges = snap.clk_edges;
+    uint32_t ones = snap.data_ones;
+    uint32_t zeros = snap.data_zeros;
+    uint32_t data_total = ones + zeros;
+    uint32_t ones_pct = (data_total > 0) ? (uint32_t)((ones * 100U) / data_total) : 0;
+    uint32_t hz = (span_us > 0) ? (uint32_t)(((uint64_t)edges * 1000000ULL) / (uint64_t)span_us) : 0;
+
+    snprintf(out,
+             out_len,
+             "clkdata: edges=%u rate~%uHz data1=%u data0=%u ones=%u%% now clk=%d data=%d",
+             (unsigned)edges,
+             (unsigned)hz,
+             (unsigned)ones,
+             (unsigned)zeros,
+             (unsigned)ones_pct,
+             clk_now,
+             data_now);
+}
+
 static void telegram_poll_and_respond(int64_t *next_offset)
 {
 #if CONFIG_SNIFFER_ENABLE_TELEGRAM
@@ -890,9 +940,10 @@ static void telegram_poll_and_respond(int64_t *next_offset)
         bool cmd_status = (strcmp(text->valuestring, "/status") == 0);
         bool cmd_get_temp = (strcmp(text->valuestring, "/get_temp") == 0);
         bool cmd_order = (strcmp(text->valuestring, "/order") == 0);
+        bool cmd_clkdata = (strcmp(text->valuestring, "/clkdata") == 0);
         bool cmd_update = (strcmp(text->valuestring, "/update") == 0);
         bool cmd_ota_legacy = (strcmp(text->valuestring, "/ota") == 0);
-        if (!cmd_status && !cmd_get_temp && !cmd_order && !cmd_update && !cmd_ota_legacy) {
+        if (!cmd_status && !cmd_get_temp && !cmd_order && !cmd_clkdata && !cmd_update && !cmd_ota_legacy) {
             continue;
         }
 
@@ -929,6 +980,15 @@ static void telegram_poll_and_respond(int64_t *next_offset)
         if (cmd_order) {
             char reply[128];
             build_order_reply(reply, sizeof(reply));
+            if (!telegram_send_text(chat_id_str, reply)) {
+                ESP_LOGW(TAG, "telegram send failed");
+            }
+            continue;
+        }
+
+        if (cmd_clkdata) {
+            char reply[160];
+            build_clkdata_reply(reply, sizeof(reply));
             if (!telegram_send_text(chat_id_str, reply)) {
                 ESP_LOGW(TAG, "telegram send failed");
             }
@@ -1410,6 +1470,19 @@ static void IRAM_ATTR clk_isr_handler(void *arg)
     ev.digit1 = (uint8_t)gpio_level_fast((gpio_num_t)DIGIT1_GPIO);
     ev.digit2 = (uint8_t)gpio_level_fast((gpio_num_t)DIGIT2_GPIO);
     ev.ts_us = esp_timer_get_time();
+
+    portENTER_CRITICAL_ISR(&s_clk_data_spinlock);
+    if (s_clk_data_diag.clk_edges == 0) {
+        s_clk_data_diag.first_edge_us = ev.ts_us;
+    }
+    s_clk_data_diag.clk_edges++;
+    s_clk_data_diag.last_edge_us = ev.ts_us;
+    if (ev.bit) {
+        s_clk_data_diag.data_ones++;
+    } else {
+        s_clk_data_diag.data_zeros++;
+    }
+    portEXIT_CRITICAL_ISR(&s_clk_data_spinlock);
 
     BaseType_t hp_task_woken = pdFALSE;
     xQueueSendFromISR(s_bit_queue, &ev, &hp_task_woken);
